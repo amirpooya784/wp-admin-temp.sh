@@ -18,14 +18,6 @@ bash <(curl -kLs https://raw.githubusercontent.com/amirpooya784/wp-admin-temp.sh
 
 The script creates `isadmin`, or updates its password when the managed account already exists.
 
-It prints:
-
-```text
-Login: https://example.com/wp-login.php
-Username: isadmin
-Password: Random15Chars
-Delete: bash /tmp/wp-admin-temp-USER_ID/wp-admin-temp.sh --delete
-```
 
 ## Delete
 
