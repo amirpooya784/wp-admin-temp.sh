@@ -4,7 +4,7 @@
 
 Create, update, and delete a temporary WordPress administrator using **WP-CLI only**.
 
-**No SQL · 15-character password · cPanel & DirectAdmin**
+**cPanel & DirectAdmin**
 
 </div>
 
