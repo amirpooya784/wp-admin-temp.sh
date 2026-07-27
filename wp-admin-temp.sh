@@ -1,34 +1,72 @@
 #!/usr/bin/env bash
-# wp-admin-temp.sh
-# Temporary WordPress administrator manager using WP-CLI only.
+# =============================================================================
+# WordPress Temporary Administrator
+# WP-CLI only — no direct SQL access
+#
 # Author: Amir Hossein Pouya
 # Repository: https://github.com/amirpooya784/wp-admin-temp.sh
+# =============================================================================
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="wp-admin-temp.sh"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="1.0.0"
 readonly RAW_URL="https://raw.githubusercontent.com/amirpooya784/wp-admin-temp.sh/main/wp-admin-temp.sh"
 readonly TEMP_USERNAME="isadmin"
 readonly TEMP_DISPLAY_NAME="Temporary Support Administrator"
-readonly MANAGED_META_KEY="_wp_admin_temp_managed_by"
-readonly MANAGED_META_VALUE="amirpooya784/wp-admin-temp.sh"
-readonly CREATED_META_KEY="_wp_admin_temp_created_at"
+readonly META_KEY="_wp_admin_temp_owner"
+readonly META_VALUE="amirpooya784/wp-admin-temp.sh"
 
 ACTION="create"
-SITE_USER=""
+HOST_USER=""
 DOMAIN=""
-CONTROL_PANEL=""
-TARGET_PATH=""
-USER_HOME=""
+PANEL="local"
+HOME_DIR=""
+WP_PATH=""
 WP_BIN=""
+RUNUSER_BIN=""
 SITE_URL=""
 PASSWORD=""
 STATE_DIR=""
 STATE_SCRIPT=""
-STATE_CONTEXT=""
+STATE_FILE=""
+
+# -----------------------------------------------------------------------------
+# Colors and compact UI
+# -----------------------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    readonly RESET=$'\033[0m'
+    readonly BOLD=$'\033[1m'
+    readonly CYAN=$'\033[38;5;45m'
+    readonly BLUE=$'\033[38;5;39m'
+    readonly GREEN=$'\033[38;5;42m'
+    readonly YELLOW=$'\033[38;5;214m'
+    readonly RED=$'\033[38;5;196m'
+    readonly GRAY=$'\033[38;5;245m'
+else
+    readonly RESET=""
+    readonly BOLD=""
+    readonly CYAN=""
+    readonly BLUE=""
+    readonly GREEN=""
+    readonly YELLOW=""
+    readonly RED=""
+    readonly GRAY=""
+fi
+
+banner() {
+    printf '\n%b╭──────────────────────────────────────────────╮%b\n' "$CYAN$BOLD" "$RESET"
+    printf '%b│  WordPress Temporary Admin                   │%b\n' "$CYAN$BOLD" "$RESET"
+    printf '%b│  WP-CLI only  •  v%-25s│%b\n' "$CYAN" "$SCRIPT_VERSION" "$RESET"
+    printf '%b╰──────────────────────────────────────────────╯%b\n\n' "$CYAN$BOLD" "$RESET"
+}
+
+ok()   { printf '%b✓%b %s\n' "$GREEN" "$RESET" "$1"; }
+info() { printf '%b›%b %s\n' "$BLUE" "$RESET" "$1"; }
+warn() { printf '%b!%b %s\n' "$YELLOW" "$RESET" "$1" >&2; }
+fail() { printf '\n%b✕ %s%b\n\n' "$RED$BOLD" "$1" "$RESET" >&2; exit 1; }
 
 cleanup_secret() {
     PASSWORD=""
@@ -36,21 +74,16 @@ cleanup_secret() {
 }
 trap cleanup_secret EXIT
 
-fail() {
-    printf 'Error: %s\n' "$1" >&2
-    exit 1
-}
-
 usage() {
-    cat <<EOF_USAGE
+    cat <<EOF
 Usage:
   bash ${SCRIPT_NAME}
   bash ${SCRIPT_NAME} --delete
   bash ${SCRIPT_NAME} --version
-EOF_USAGE
+EOF
 }
 
-parse_arguments() {
+parse_args() {
     (( $# <= 1 )) || fail "Only one option is allowed."
 
     case "${1:-}" in
@@ -62,12 +95,15 @@ parse_arguments() {
     esac
 }
 
-require_command() {
-    command -v "$1" >/dev/null 2>&1 || fail "Required command not found: $1"
+need() {
+    command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
 }
 
-validate_account_username() {
-    [[ "$SITE_USER" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] \
+# -----------------------------------------------------------------------------
+# Hosting and WordPress path detection
+# -----------------------------------------------------------------------------
+validate_host_user() {
+    [[ "$HOST_USER" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] \
         || fail "Invalid hosting username."
 }
 
@@ -80,41 +116,41 @@ validate_domain() {
     [[ "$DOMAIN" != *..* ]] || fail "Invalid domain."
 }
 
-detect_control_panel() {
-    local cpanel=0
-    local directadmin=0
+detect_panel() {
+    local has_cpanel=0
+    local has_directadmin=0
 
-    [[ -x /usr/local/cpanel/cpanel || -d /var/cpanel/users ]] && cpanel=1
-    [[ -x /usr/local/directadmin/directadmin || -d /usr/local/directadmin/data/users ]] && directadmin=1
+    [[ -x /usr/local/cpanel/cpanel || -d /var/cpanel/users ]] && has_cpanel=1
+    [[ -x /usr/local/directadmin/directadmin || -d /usr/local/directadmin/data/users ]] && has_directadmin=1
 
-    if (( cpanel == 1 && directadmin == 1 )); then
+    if (( has_cpanel && has_directadmin )); then
         fail "Both cPanel and DirectAdmin were detected."
-    elif (( cpanel == 1 )); then
-        CONTROL_PANEL="cpanel"
-    elif (( directadmin == 1 )); then
-        CONTROL_PANEL="directadmin"
+    elif (( has_cpanel )); then
+        PANEL="cpanel"
+    elif (( has_directadmin )); then
+        PANEL="directadmin"
     else
         fail "cPanel or DirectAdmin was not detected."
     fi
 }
 
-load_account_home() {
-    local entry
+load_home_dir() {
+    local passwd_row
 
-    entry="$(getent passwd "$SITE_USER" || true)"
-    [[ -n "$entry" ]] || fail "Hosting account not found."
+    passwd_row="$(getent passwd "$HOST_USER" || true)"
+    [[ -n "$passwd_row" ]] || fail "Hosting account not found."
 
-    USER_HOME="$(printf '%s' "$entry" | cut -d: -f6)"
-    [[ -d "$USER_HOME" ]] || fail "Hosting home directory not found."
+    HOME_DIR="$(cut -d: -f6 <<<"$passwd_row")"
+    [[ -d "$HOME_DIR" ]] || fail "Hosting home directory not found."
 }
 
-resolve_cpanel_document_root() {
-    local metadata="/var/cpanel/userdata/${SITE_USER}/${DOMAIN}"
-    local document_root
+cpanel_docroot() {
+    local metadata="/var/cpanel/userdata/${HOST_USER}/${DOMAIN}"
+    local docroot=""
 
     [[ -f "$metadata" ]] || fail "Domain is not assigned to this cPanel account."
 
-    document_root="$(
+    docroot="$(
         sed -n '/^[[:space:]]*documentroot:[[:space:]]*/ {
             s/^[[:space:]]*documentroot:[[:space:]]*//
             p
@@ -122,75 +158,79 @@ resolve_cpanel_document_root() {
         }' "$metadata"
     )"
 
-    document_root="${document_root#\"}"
-    document_root="${document_root%\"}"
-    document_root="${document_root#\'}"
-    document_root="${document_root%\'}"
+    docroot="${docroot#\"}"
+    docroot="${docroot%\"}"
+    docroot="${docroot#\'}"
+    docroot="${docroot%\'}"
 
-    [[ -n "$document_root" ]] || fail "Document root was not found."
-    printf '%s\n' "$document_root"
+    [[ -n "$docroot" ]] || fail "Document root was not found."
+    printf '%s\n' "$docroot"
 }
 
-resolve_directadmin_document_root() {
-    local config="/usr/local/directadmin/data/users/${SITE_USER}/domains/${DOMAIN}.conf"
+directadmin_docroot() {
+    local config="/usr/local/directadmin/data/users/${HOST_USER}/domains/${DOMAIN}.conf"
 
     [[ -f "$config" ]] || fail "Domain is not assigned to this DirectAdmin account."
-    printf '%s/domains/%s/public_html\n' "${USER_HOME%/}" "$DOMAIN"
+    printf '%s/domains/%s/public_html\n' "${HOME_DIR%/}" "$DOMAIN"
 }
 
-resolve_target_path() {
-    local proposed
-    local canonical_home
+resolve_wp_path() {
+    local candidate=""
+    local safe_home=""
 
-    require_command realpath
+    need realpath
 
     if (( EUID == 0 )); then
-        require_command getent
-        require_command runuser
+        need getent
+        RUNUSER_BIN="$(command -v runuser || true)"
+        if [[ -z "$RUNUSER_BIN" && -x /usr/sbin/runuser ]]; then
+            RUNUSER_BIN="/usr/sbin/runuser"
+        fi
+        [[ -n "$RUNUSER_BIN" && -x "$RUNUSER_BIN" ]] || fail "Missing command: runuser"
 
-        detect_control_panel
+        detect_panel
+        ok "Panel: ${PANEL}"
 
-        printf 'Hosting username: '
-        read -r SITE_USER
-        printf 'Domain: '
+        printf '%bHosting username:%b ' "$BOLD" "$RESET"
+        read -r HOST_USER
+        printf '%bDomain:%b ' "$BOLD" "$RESET"
         read -r DOMAIN
 
-        validate_account_username
+        validate_host_user
         validate_domain
-        load_account_home
+        load_home_dir
 
-        if [[ "$CONTROL_PANEL" == "cpanel" ]]; then
-            proposed="$(resolve_cpanel_document_root)"
+        if [[ "$PANEL" == "cpanel" ]]; then
+            candidate="$(cpanel_docroot)"
         else
-            proposed="$(resolve_directadmin_document_root)"
+            candidate="$(directadmin_docroot)"
         fi
 
-        [[ -d "$proposed" ]] || fail "Document root not found."
+        [[ -d "$candidate" ]] || fail "Document root not found."
 
-        TARGET_PATH="$(realpath -e -- "$proposed")"
-        canonical_home="$(realpath -e -- "$USER_HOME")"
+        WP_PATH="$(realpath -e -- "$candidate")"
+        safe_home="$(realpath -e -- "$HOME_DIR")"
 
-        case "${TARGET_PATH}/" in
-            "${canonical_home}/"*) ;;
+        case "${WP_PATH}/" in
+            "${safe_home}/"*) ;;
             *) fail "Document root is outside the hosting account home." ;;
         esac
     else
-        SITE_USER="$(id -un)"
-        USER_HOME="${HOME:-$(getent passwd "$SITE_USER" | cut -d: -f6)}"
-        TARGET_PATH="$(pwd -P)"
-        CONTROL_PANEL="local"
+        HOST_USER="$(id -un)"
+        HOME_DIR="${HOME:-$(getent passwd "$HOST_USER" | cut -d: -f6)}"
+        WP_PATH="$(pwd -P)"
     fi
 }
 
 find_wp_cli() {
     WP_BIN="$(command -v wp || true)"
-    [[ -n "$WP_BIN" && -x "$WP_BIN" ]] || fail "WP-CLI was not found."
+    [[ -n "$WP_BIN" ]] || fail "WP-CLI was not found."
     WP_BIN="$(realpath -e -- "$WP_BIN")"
 }
 
 wp_run() {
-    local -a args=(
-        "--path=${TARGET_PATH}"
+    local -a global_args=(
+        "--path=${WP_PATH}"
         "--skip-plugins"
         "--skip-themes"
         "--skip-packages"
@@ -198,130 +238,182 @@ wp_run() {
     )
 
     if (( EUID == 0 )); then
-        runuser -u "$SITE_USER" -- env \
-            "HOME=${USER_HOME}" \
+        "$RUNUSER_BIN" -u "$HOST_USER" -- env \
+            "HOME=${HOME_DIR}" \
             "PATH=${PATH}" \
             "WP_CLI_CONFIG_PATH=/dev/null" \
             "WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1" \
-            "$WP_BIN" "${args[@]}" "$@"
+            "$WP_BIN" "${global_args[@]}" "$@"
     else
         env \
             "WP_CLI_CONFIG_PATH=/dev/null" \
             "WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1" \
-            "$WP_BIN" "${args[@]}" "$@"
+            "$WP_BIN" "${global_args[@]}" "$@"
     fi
 }
 
 verify_wordpress() {
-    [[ -f "$TARGET_PATH/wp-config.php" ]] || fail "WordPress was not found."
-    [[ -f "$TARGET_PATH/wp-load.php" ]] || fail "WordPress was not found."
-    [[ -d "$TARGET_PATH/wp-admin" ]] || fail "WordPress was not found."
-    [[ -d "$TARGET_PATH/wp-includes" ]] || fail "WordPress was not found."
+    [[ -f "$WP_PATH/wp-config.php" ]] || fail "WordPress was not found."
+    [[ -f "$WP_PATH/wp-load.php" ]] || fail "WordPress was not found."
+    [[ -d "$WP_PATH/wp-admin" ]] || fail "WordPress was not found."
+    [[ -d "$WP_PATH/wp-includes" ]] || fail "WordPress was not found."
 
-    wp_run core is-installed >/dev/null 2>&1 \
-        || fail "WordPress was not found."
+    wp_run core is-installed >/dev/null 2>&1 || fail "WordPress was not found."
 
     if wp_run core is-installed --network >/dev/null 2>&1; then
         fail "WordPress Multisite is not supported."
     fi
 
-    SITE_URL="$(wp_run option get siteurl 2>/dev/null)"
-    [[ -n "$SITE_URL" ]] || fail "WordPress site URL was not found."
+    SITE_URL="$(wp_run option get siteurl 2>/dev/null || true)"
+    [[ -n "$SITE_URL" ]] || fail "Site URL was not found."
 }
 
-state_path_for_site() {
+# -----------------------------------------------------------------------------
+# Safe temporary installation and saved site context
+# -----------------------------------------------------------------------------
+build_state_paths() {
     local owner_uid
     local site_hash
 
-    require_command sha256sum
+    need sha256sum
 
-    owner_uid="$(id -u "$SITE_USER")"
-    site_hash="$(printf '%s' "$TARGET_PATH" | sha256sum | awk '{print substr($1,1,12)}')"
+    owner_uid="$(id -u "$HOST_USER")"
+    site_hash="$(printf '%s' "$WP_PATH" | sha256sum | awk '{print substr($1,1,12)}')"
 
     STATE_DIR="/tmp/wp-admin-temp-${owner_uid}-${site_hash}"
     STATE_SCRIPT="${STATE_DIR}/${SCRIPT_NAME}"
-    STATE_CONTEXT="${STATE_DIR}/site.context"
+    STATE_FILE="${STATE_DIR}/site.env"
 }
 
-save_context() {
+assert_safe_state_dir() {
+    [[ "$STATE_DIR" == /tmp/wp-admin-temp-[0-9]*-[a-f0-9]* ]] \
+        || fail "Unsafe temporary path."
+    [[ ! -L "$STATE_DIR" ]] || fail "Unsafe temporary path."
+}
+
+save_state() {
+    assert_safe_state_dir
+
     mkdir -p -- "$STATE_DIR"
     chmod 700 -- "$STATE_DIR"
 
-    {
-        printf 'SITE_USER=%q\n' "$SITE_USER"
-        printf 'DOMAIN=%q\n' "$DOMAIN"
-        printf 'CONTROL_PANEL=%q\n' "$CONTROL_PANEL"
-        printf 'TARGET_PATH=%q\n' "$TARGET_PATH"
-        printf 'USER_HOME=%q\n' "$USER_HOME"
-        printf 'WP_BIN=%q\n' "$WP_BIN"
-        printf 'SITE_URL=%q\n' "$SITE_URL"
-    } > "$STATE_CONTEXT"
+    [[ ! -L "$STATE_FILE" ]] || fail "Unsafe state file."
 
-    chmod 600 -- "$STATE_CONTEXT"
+    {
+        printf 'HOST_USER=%q\n' "$HOST_USER"
+        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'PANEL=%q\n' "$PANEL"
+        printf 'HOME_DIR=%q\n' "$HOME_DIR"
+        printf 'WP_PATH=%q\n' "$WP_PATH"
+        printf 'WP_BIN=%q\n' "$WP_BIN"
+        printf 'RUNUSER_BIN=%q\n' "$RUNUSER_BIN"
+        printf 'SITE_URL=%q\n' "$SITE_URL"
+    } > "$STATE_FILE"
+
+    chmod 600 -- "$STATE_FILE"
 }
 
-install_temp_copy() {
-    local source_path="${BASH_SOURCE[0]}"
+local_script_path() {
+    local source_path="${BASH_SOURCE[0]:-}"
 
-    if [[ -f "$source_path" && "$source_path" != /dev/fd/* && "$source_path" != /proc/*/fd/* ]]; then
+    # Process substitution paths are ephemeral. Never call realpath on them.
+    case "$source_path" in
+        ""|/dev/fd/*|/proc/*/fd/*) return 1 ;;
+    esac
+
+    [[ -f "$source_path" ]] || return 1
+    realpath -e -- "$source_path" 2>/dev/null
+}
+
+install_temp_script() {
+    local source_path=""
+    local download_url=""
+
+    assert_safe_state_dir
+    [[ ! -L "$STATE_SCRIPT" ]] || fail "Unsafe temporary script path."
+
+    source_path="$(local_script_path || true)"
+
+    if [[ -n "$source_path" ]]; then
         cp -- "$source_path" "$STATE_SCRIPT"
     else
-        require_command curl
-        curl -kfsSL "$RAW_URL" -o "$STATE_SCRIPT" \
+        need curl
+        download_url="${RAW_URL}?version=${SCRIPT_VERSION}&time=$(date +%s)"
+        curl -kfsSL \
+            -H 'Cache-Control: no-cache' \
+            -H 'Pragma: no-cache' \
+            "$download_url" \
+            -o "$STATE_SCRIPT" \
             || fail "Could not save the script in /tmp."
     fi
 
     chmod 700 -- "$STATE_SCRIPT"
-    bash -n "$STATE_SCRIPT" || fail "The saved script is invalid."
+    bash -n "$STATE_SCRIPT" || fail "Downloaded script is invalid."
+
+    # Reject an outdated or unrelated copy before execution.
+    grep -Fq 'readonly SCRIPT_VERSION="3.0.0"' "$STATE_SCRIPT" \
+        || fail "Downloaded script version is outdated."
 }
 
-bootstrap_to_temp() {
-    resolve_target_path
+bootstrap() {
+    resolve_wp_path
     find_wp_cli
     verify_wordpress
-    state_path_for_site
-    save_context
-    install_temp_copy
+    ok "WordPress: ${DOMAIN:-local site}"
 
-    exec bash "$STATE_SCRIPT" "$([[ "$ACTION" == "delete" ]] && printf '%s' '--delete' || printf '%s' '--create')"
+    build_state_paths
+    save_state
+    install_temp_script
+
+    exec bash "$STATE_SCRIPT" "--${ACTION}"
 }
 
-load_temp_context() {
-    local script_path
-    local script_dir
+load_saved_state() {
+    local source_path=""
+    local source_dir=""
 
-    script_path="$(realpath -e -- "${BASH_SOURCE[0]}")"
-    script_dir="$(dirname -- "$script_path")"
+    source_path="$(local_script_path || true)"
+    [[ -n "$source_path" ]] || return 1
 
-    [[ "$script_dir" == /tmp/wp-admin-temp-* ]] || return 1
-    [[ "$(basename -- "$script_path")" == "$SCRIPT_NAME" ]] || return 1
-    [[ -f "$script_dir/site.context" ]] || return 1
+    source_dir="$(dirname -- "$source_path")"
+    [[ "$source_dir" == /tmp/wp-admin-temp-* ]] || return 1
+    [[ "$(basename -- "$source_path")" == "$SCRIPT_NAME" ]] || return 1
+    [[ -f "$source_dir/site.env" ]] || return 1
+    [[ ! -L "$source_dir/site.env" ]] || fail "Unsafe state file."
 
-    STATE_DIR="$script_dir"
-    STATE_SCRIPT="$script_path"
-    STATE_CONTEXT="$script_dir/site.context"
+    STATE_DIR="$source_dir"
+    STATE_SCRIPT="$source_path"
+    STATE_FILE="${source_dir}/site.env"
 
-    # The file is private to the invoking account and contains only shell-escaped declarations.
     # shellcheck disable=SC1090
-    source "$STATE_CONTEXT"
+    source "$STATE_FILE"
 
-    [[ "$TARGET_PATH" == /* ]] || fail "Invalid saved WordPress path."
-    [[ "$WP_BIN" == /* && -x "$WP_BIN" ]] || fail "Saved WP-CLI path is invalid."
+    [[ "$WP_PATH" == /* ]] || fail "Invalid saved WordPress path."
+    [[ "$WP_BIN" == /* && -x "$WP_BIN" ]] || fail "Invalid saved WP-CLI path."
 
     verify_wordpress
     return 0
 }
 
-generate_password() {
-    local random_data
-    local candidate
+remove_state() {
+    assert_safe_state_dir
+    rm -f -- "$STATE_FILE" "$STATE_SCRIPT"
+    rmdir -- "$STATE_DIR" 2>/dev/null || true
+}
 
-    require_command openssl
-    require_command tr
+# -----------------------------------------------------------------------------
+# Temporary administrator operations
+# -----------------------------------------------------------------------------
+generate_password() {
+    local pool=""
+    local candidate=""
+
+    need openssl
+    need tr
 
     while :; do
-        random_data="$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9')"
-        candidate="${random_data:0:15}"
+        pool="$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9')"
+        candidate="${pool:0:15}"
 
         if [[ ${#candidate} -eq 15 \
             && "$candidate" =~ [A-Z] \
@@ -333,37 +425,45 @@ generate_password() {
     done
 }
 
-mark_managed_user() {
+mark_user() {
     local user_id="$1"
-    local created_at
-
-    created_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    wp_run user meta update "$user_id" "$MANAGED_META_KEY" "$MANAGED_META_VALUE" >/dev/null
-    wp_run user meta update "$user_id" "$CREATED_META_KEY" "$created_at" >/dev/null
+    wp_run user meta update "$user_id" "$META_KEY" "$META_VALUE" >/dev/null
 }
 
 is_managed_user() {
     local user_id="$1"
-    local marker
+    local marker=""
 
-    marker="$(wp_run user meta get "$user_id" "$MANAGED_META_KEY" 2>/dev/null || true)"
-    [[ "$marker" == "$MANAGED_META_VALUE" ]]
+    marker="$(wp_run user meta get "$user_id" "$META_KEY" 2>/dev/null || true)"
+    [[ "$marker" == "$META_VALUE" ]]
 }
 
-create_or_update_user() {
-    local user_id
-    local email
+show_access() {
+    local delete_command
+    printf -v delete_command 'bash %q --delete' "$STATE_SCRIPT"
+
+    printf '\n%b╭─ Access%b\n' "$CYAN$BOLD" "$RESET"
+    printf '%b│%b %-9s %s\n' "$CYAN" "$RESET" "Login" "${SITE_URL%/}/wp-login.php"
+    printf '%b│%b %-9s %b%s%b\n' "$CYAN" "$RESET" "Username" "$BOLD" "$TEMP_USERNAME" "$RESET"
+    printf '%b│%b %-9s %b%s%b\n' "$CYAN" "$RESET" "Password" "$GREEN$BOLD" "$PASSWORD" "$RESET"
+    printf '%b├─ Remove%b\n' "$CYAN$BOLD" "$RESET"
+    printf '%b│%b %s\n' "$CYAN" "$RESET" "$delete_command"
+    printf '%b╰──────────────────────────────────────────────╯%b\n\n' "$CYAN$BOLD" "$RESET"
+}
+
+create_or_update() {
+    local user_id=""
+    local email=""
 
     generate_password
 
     if wp_run user exists "$TEMP_USERNAME" >/dev/null 2>&1; then
-        printf 'Existing account found. Updating password...\n'
+        info "Existing account — updating"
         user_id="$(wp_run user get "$TEMP_USERNAME" --field=ID)"
-
         printf '%s\n' "$PASSWORD" \
             | wp_run user update "$user_id" --prompt=user_pass >/dev/null
     else
-        printf 'Creating new account...\n'
+        info "New account — creating"
         email="${TEMP_USERNAME}.$(date -u +%s)@example.invalid"
 
         printf '%s\n' "$PASSWORD" \
@@ -376,74 +476,68 @@ create_or_update_user() {
     fi
 
     wp_run user set-role "$user_id" administrator >/dev/null
-    mark_managed_user "$user_id"
+    mark_user "$user_id"
     wp_run user session destroy "$user_id" --all >/dev/null 2>&1 || true
 
-    printf 'Login: %s/wp-login.php\n' "${SITE_URL%/}"
-    printf 'Username: %s\n' "$TEMP_USERNAME"
-    printf 'Password: %s\n' "$PASSWORD"
-    printf 'Delete: bash %q --delete\n' "$STATE_SCRIPT"
+    ok "Account ready"
+    show_access
 }
 
 find_reassign_admin() {
     local excluded_id="$1"
-    local candidate
+    local candidate=""
+    local admin_ids=""
+
+    admin_ids="$(wp_run user list --role=administrator --field=ID)"
 
     while IFS= read -r candidate; do
         if [[ -n "$candidate" && "$candidate" != "$excluded_id" ]]; then
             printf '%s\n' "$candidate"
             return 0
         fi
-    done < <(wp_run user list --role=administrator --field=ID)
+    done <<< "$admin_ids"
 
     return 1
 }
 
-remove_state_files() {
-    local expected_prefix="/tmp/wp-admin-temp-"
-
-    [[ "$STATE_DIR" == "${expected_prefix}"* ]] \
-        || fail "Unsafe temporary path."
-
-    rm -f -- "$STATE_CONTEXT" "$STATE_SCRIPT"
-    rmdir -- "$STATE_DIR" 2>/dev/null || true
-}
-
-delete_user() {
-    local user_id
-    local reassign_id
+delete_account() {
+    local user_id=""
+    local reassign_id=""
 
     if ! wp_run user exists "$TEMP_USERNAME" >/dev/null 2>&1; then
-        remove_state_files
-        printf 'Account not found. Temporary files removed.\n'
+        remove_state
+        warn "Account not found"
         return 0
     fi
 
     user_id="$(wp_run user get "$TEMP_USERNAME" --field=ID)"
-
-    if ! is_managed_user "$user_id"; then
-        fail "The account is not managed by this script."
-    fi
+    is_managed_user "$user_id" || fail "This account is not managed by the script."
 
     reassign_id="$(find_reassign_admin "$user_id" || true)"
     [[ -n "$reassign_id" ]] || fail "No other administrator exists."
 
     wp_run user delete "$user_id" --reassign="$reassign_id" --yes >/dev/null
-    remove_state_files
+    remove_state
 
-    printf 'Account deleted.\n'
+    ok "Account deleted"
+    printf '\n'
 }
 
 main() {
-    parse_arguments "$@"
+    parse_args "$@"
 
-    if ! load_temp_context; then
-        bootstrap_to_temp
+    if [[ "${WP_ADMIN_TEMP_BANNER_SHOWN:-0}" != "1" ]]; then
+        banner
+        export WP_ADMIN_TEMP_BANNER_SHOWN=1
+    fi
+
+    if ! load_saved_state; then
+        bootstrap
     fi
 
     case "$ACTION" in
-        create) create_or_update_user ;;
-        delete) delete_user ;;
+        create) create_or_update ;;
+        delete) delete_account ;;
         *) fail "Invalid action." ;;
     esac
 }
