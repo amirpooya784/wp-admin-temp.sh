@@ -12,7 +12,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="wp-admin-temp.sh"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly RAW_URL="https://raw.githubusercontent.com/amirpooya784/wp-admin-temp.sh/main/wp-admin-temp.sh"
 readonly TEMP_USERNAME="isadmin"
 readonly TEMP_DISPLAY_NAME="Temporary Support Administrator"
