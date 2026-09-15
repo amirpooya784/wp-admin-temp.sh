@@ -174,6 +174,46 @@ directadmin_docroot() {
     printf '%s/domains/%s/public_html\n' "${HOME_DIR%/}" "$DOMAIN"
 }
 
+
+# Detect site from current working directory.
+# Supports DirectAdmin/cPanel style layouts and subdomains.
+detect_current_site() {
+    local current
+    current="$(pwd -P)"
+
+    if [[ "$current" =~ ^/home/([^/]+)/domains/([^/]+)/public_html(/.*)?$ ]]; then
+        HOST_USER="${BASH_REMATCH[1]}"
+        DOMAIN="${BASH_REMATCH[2]}"
+        WP_PATH="$current"
+
+        ok "Detected user: ${HOST_USER}"
+        ok "Detected domain: ${DOMAIN}"
+        ok "Detected path: ${WP_PATH}"
+        return 0
+    fi
+
+    return 1
+}
+
+find_domain_docroot() {
+    local result=""
+
+    [[ -d "${HOME_DIR}/domains" ]] || fail "Domains directory not found."
+
+    result="$({
+        find "${HOME_DIR}/domains" -type d -name public_html -print 2>/dev/null \
+        | while IFS= read -r path; do
+            if [[ "${path}" == */"${DOMAIN}"/public_html ]]; then
+                printf '%s\n' "${path}"
+                break
+            fi
+        done
+    })"
+
+    [[ -n "$result" ]] || fail "Domain path not found."
+    printf '%s\n' "$result"
+}
+
 resolve_wp_path() {
     local candidate=""
     local safe_home=""
@@ -188,27 +228,28 @@ resolve_wp_path() {
         fi
         [[ -n "$RUNUSER_BIN" && -x "$RUNUSER_BIN" ]] || fail "Missing command: runuser"
 
-        detect_panel
-        ok "Panel: ${PANEL}"
+        if ! detect_current_site; then
+            detect_panel
+            ok "Panel: ${PANEL}"
 
-        printf '%bHosting username:%b ' "$BOLD" "$RESET"
-        read -r HOST_USER
-        printf '%bDomain:%b ' "$BOLD" "$RESET"
-        read -r DOMAIN
+            printf '%bHosting username:%b ' "$BOLD" "$RESET"
+            read -r HOST_USER
 
-        validate_host_user
-        validate_domain
-        load_home_dir
+            printf '%bDomain:%b ' "$BOLD" "$RESET"
+            read -r DOMAIN
 
-        if [[ "$PANEL" == "cpanel" ]]; then
-            candidate="$(cpanel_docroot)"
+            validate_host_user
+            validate_domain
+            load_home_dir
+
+            candidate="$(find_domain_docroot)"
+            [[ -d "$candidate" ]] || fail "Document root not found."
+
+            WP_PATH="$(realpath -e -- "$candidate")"
         else
-            candidate="$(directadmin_docroot)"
+            load_home_dir
+            WP_PATH="$(realpath -e -- "$WP_PATH")"
         fi
-
-        [[ -d "$candidate" ]] || fail "Document root not found."
-
-        WP_PATH="$(realpath -e -- "$candidate")"
         safe_home="$(realpath -e -- "$HOME_DIR")"
 
         case "${WP_PATH}/" in
@@ -351,8 +392,8 @@ install_temp_script() {
     bash -n "$STATE_SCRIPT" || fail "Downloaded script is invalid."
 
     # Reject an outdated or unrelated copy before execution.
-    grep -Fq 'readonly SCRIPT_VERSION="3.0.0"' "$STATE_SCRIPT" \
-        || fail "Downloaded script version is outdated."
+    grep -Fq 'readonly SCRIPT_VERSION=' "$STATE_SCRIPT" \
+        || fail "Downloaded script is invalid."
 }
 
 bootstrap() {
@@ -543,3 +584,4 @@ main() {
 }
 
 main "$@"
+```
